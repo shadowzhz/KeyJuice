@@ -3,7 +3,6 @@ import glob
 import json
 import os
 import select
-import sys
 
 def find_hidraw_node():
     # 1. 优先从 /dev/input/by-id 查找固定的 if03 符号链接
@@ -42,7 +41,7 @@ def query_battery(dev_path):
 
     try:
         # 键盘休眠时首次请求用于唤醒射频链路，超时重发一次
-        for attempt in range(2):
+        for _ in range(2):
             try:
                 os.write(fd, req)
             except Exception as e:
@@ -64,6 +63,8 @@ def query_battery(dev_path):
 
                 if level is not None and 0 <= level <= 100:
                     return {"online": True, "percentage": level}
+    except OSError as e:
+        return {"online": False, "error": str(e)}
     finally:
         os.close(fd)
 

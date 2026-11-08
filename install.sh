@@ -33,16 +33,16 @@ if command -v gnome-extensions >/dev/null 2>&1; then
     gnome-extensions enable "${UUID}" 2>/dev/null || true
 fi
 
-CURRENT_EXTS=$(gsettings get org.gnome.shell enabled-extensions)
-if [[ "${CURRENT_EXTS}" != *"${UUID}"* ]]; then
-    python3 -c "
-import ast, subprocess
-lst = ast.literal_eval('''${CURRENT_EXTS}''')
-if '${UUID}' not in lst:
-    lst.append('${UUID}')
-subprocess.run(['gsettings', 'set', 'org.gnome.shell', 'enabled-extensions', str(lst)], check=True)
-"
-fi
+/usr/bin/python3 - <<'PYSETTINGS'
+from gi.repository import Gio
+settings = Gio.Settings.new('org.gnome.shell')
+uuid = 'keyjuice@shadowemperor'
+values = list(settings.get_strv('enabled-extensions'))
+if uuid not in values:
+    values.append(uuid)
+    settings.set_strv('enabled-extensions', values)
+    Gio.Settings.sync()
+PYSETTINGS
 echo "[3/3] 已启用 ${UUID}"
 
 echo ""

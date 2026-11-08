@@ -42,13 +42,13 @@
 
 ### 1. 环境依赖
 - **操作系统**：Ubuntu 23.10+ / Fedora 39+ / Arch Linux 或任意运行 **GNOME Shell 45+** 的发行版
-- **Python 环境**：Python 3.x（系统通常自带）
+- **Python 环境**：Python 3.x 与系统 PyGObject（Debian/Ubuntu: python3-gi）
 
 ### 2. 一键安装
 克隆本仓库并执行安装脚本：
 
 ```bash
-git clone https://github.com/shadowemperor/KeyJuice.git
+git clone https://github.com/shadowzhz/KeyJuice.git
 cd KeyJuice
 chmod +x install.sh
 ./install.sh
@@ -82,7 +82,7 @@ chmod +x install.sh
 ### 如何协助抓取 HID 报文：
 1. 插入 2.4G 接收器，运行 `lsusb` 查看接收器的 `VID:PID`。
 2. 在 Windows 虚拟机中通过官方驱动查询电量，同时在 Linux 宿主机通过 `wireshark` 监听 `usbmon` 接口获取电量请求包与响应包。
-3. 或者直接在 GitHub 提交 [Issue](https://github.com/shadowemperor/KeyJuice/issues)，附上你的设备型号、`lsusb` 输出与相关信息。
+3. 或者直接在 GitHub 提交 [Issue](https://github.com/shadowzhz/KeyJuice/issues)，附上你的设备型号、`lsusb` 输出与相关信息。
 
 ---
 

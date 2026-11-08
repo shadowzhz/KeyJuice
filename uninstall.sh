@@ -34,21 +34,16 @@ else
     echo "[3/3] udev 规则未配置或已移除，跳过"
 fi
 
-# 4. 清理 enabled-extensions 配置
-if command -v gsettings >/dev/null 2>&1; then
-    python3 -c "
-import ast, subprocess
-try:
-    res = subprocess.run(['gsettings', 'get', 'org.gnome.shell', 'enabled-extensions'], capture_output=True, text=True, check=True)
-    lst = ast.literal_eval(res.stdout.strip())
-    if '${UUID}' in lst:
-        lst.remove('${UUID}')
-        subprocess.run(['gsettings', 'set', 'org.gnome.shell', 'enabled-extensions', str(lst)], check=True)
-except Exception:
-    pass
-" 2>/dev/null || true
-fi
-
+/usr/bin/python3 - <<'PYSETTINGS'
+from gi.repository import Gio
+settings = Gio.Settings.new('org.gnome.shell')
+uuid = 'keyjuice@shadowemperor'
+values = list(settings.get_strv('enabled-extensions'))
+if uuid in values:
+    values.remove(uuid)
+    settings.set_strv('enabled-extensions', values)
+    Gio.Settings.sync()
+PYSETTINGS
 echo ""
 echo "=== 卸载成功！==="
 echo "如果状态栏图标未立即消失，可通过注销并重新登录或重启桌面生效。"

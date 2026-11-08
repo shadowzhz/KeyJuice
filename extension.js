@@ -24,7 +24,7 @@ class BatterySmoother {
 
 
     update(rawPct, isCharging = false) {
-        if (rawPct <= 0) return rawPct;
+        if (rawPct === 0) { this.reset(0); return 0; }
 
         if (this.currentDisplay === null) {
             this.currentDisplay = rawPct;
@@ -72,6 +72,10 @@ class KeyJuiceIndicator extends PanelMenu.Button {
         this._extPath = extPath;
         this._kb24gInfo = null;
         this._querying24g = false;
+        this._destroyed = false;
+        this._cancellable = new Gio.Cancellable();
+        this._sampleTokens = new Map();
+        this._sampleValues = new Map();
 
         this._box = new St.BoxLayout({
             style_class: 'panel-status-indicators-box keyjuice-box',
@@ -118,13 +122,11 @@ class KeyJuiceIndicator extends PanelMenu.Button {
 
         this._deviceProxies = new Map();
         this._smoothers = new Map();
-        this._seenOnline = new Set();
         this._timerId = 0;
         this._upowerProxy = null;
         this._upowerSignalId = 0;
 
-        this._initDBus();
-        this._refresh();
+        this._initDBus().then(() => this._refresh());
 
         // 10s fallback interval
         this._timerId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 10, () => {
@@ -133,7 +135,7 @@ class KeyJuiceIndicator extends PanelMenu.Button {
         });
     }
 
-    _initDBus() {
+    async _initDBus() {
         try {
             this._upowerProxy = new Gio.DBusProxy({
                 g_bus_type: Gio.BusType.SYSTEM,
@@ -141,7 +143,8 @@ class KeyJuiceIndicator extends PanelMenu.Button {
                 g_object_path: '/org/freedesktop/UPower',
                 g_interface_name: 'org.freedesktop.UPower',
             });
-            this._upowerProxy.init(null);
+            await this._initProxy(this._upowerProxy);
+            if (this._destroyed) return;
 
             this._upowerSignalId = this._upowerProxy.connect('g-signal', (proxy, sender, signalName) => {
                 if (signalName === 'DeviceAdded' || signalName === 'DeviceRemoved') {
@@ -149,12 +152,30 @@ class KeyJuiceIndicator extends PanelMenu.Button {
                 }
             });
         } catch (e) {
-            console.error('[KeyJuice] Failed to init UPower DBus proxy:', e);
+            this._upowerProxy = null;
+            if (!this._destroyed) console.error('[KeyJuice] UPower initialization failed:', e);
         }
     }
 
+    _initProxy(proxy) {
+        return new Promise((resolve, reject) => {
+            proxy.init_async(GLib.PRIORITY_DEFAULT, this._cancellable, (p, result) => {
+                try { p.init_finish(result); resolve(); } catch (e) { reject(e); }
+            });
+        });
+    }
+
+    _sample(key, token, raw, charging) {
+        if (!this._smoothers.has(key)) this._smoothers.set(key, new BatterySmoother());
+        if (this._sampleTokens.get(key) !== token || !this._sampleValues.has(key)) {
+            this._sampleTokens.set(key, token);
+            this._sampleValues.set(key, this._smoothers.get(key).update(raw, charging));
+        }
+        return this._sampleValues.get(key);
+    }
+
     _query24GKeyboard() {
-        if (this._querying24g || !this._extPath) return;
+        if (this._destroyed || this._querying24g || !this._extPath) return;
 
         const helperPath = GLib.build_filenamev([this._extPath, 'x87_battery.py']);
         if (!GLib.file_test(helperPath, GLib.FileTest.IS_EXECUTABLE)) return;
@@ -165,37 +186,51 @@ class KeyJuiceIndicator extends PanelMenu.Button {
                 [helperPath],
                 Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_SILENCE
             );
-            proc.communicate_utf8_async(null, null, (p, res) => {
+            this._proc = proc;
+            this._queryTimeout = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 3, () => {
+                this._queryTimeout = 0;
+                proc.force_exit();
+                return GLib.SOURCE_REMOVE;
+            });
+            proc.communicate_utf8_async(null, this._cancellable, (p, res) => {
                 this._querying24g = false;
+                if (this._queryTimeout) GLib.source_remove(this._queryTimeout);
+                this._queryTimeout = 0;
                 try {
                     const [, stdout] = p.communicate_utf8_finish(res);
-                    if (stdout) {
+                    if (this._destroyed) return;
+                    this._proc = null;
+                    this._kb24gInfo = null;
+                    if (stdout && p.get_successful()) {
                         const data = JSON.parse(stdout.trim());
-                        if (data.online && data.percentage !== undefined) {
+                        if (data.online && Number.isFinite(data.percentage) && data.percentage >= 0 && data.percentage <= 100) {
                             this._kb24gInfo = {
                                 percentage: data.percentage,
                                 online: true,
+                                token: GLib.get_monotonic_time(),
                             };
                         } else {
                             this._kb24gInfo = null;
                         }
-                        this._updateDisplay();
                     }
+                    this._updateDisplay();
                 } catch (e) {
                     this._kb24gInfo = null;
+                    if (!this._destroyed) this._updateDisplay();
                 }
             });
         } catch (e) {
             this._querying24g = false;
             this._kb24gInfo = null;
+            this._updateDisplay();
         }
     }
 
-    _classifyDevice(model, nativePath, type) {
+    _classifyDevice(model, nativePath, type, powerSupply = false) {
         const s = `${model} ${nativePath}`.toLowerCase();
 
         // Skip internal battery / AC power / display
-        if (s.includes('bat0') || s.includes('adp0') || s.includes('line_power') || s.includes('displaydevice') || type === 1 || type === 2) {
+        if (s.includes('bat0') || s.includes('adp0') || s.includes('line_power') || s.includes('displaydevice') || type === 1 || (type === 2 && powerSupply)) {
             return null;
         }
 
@@ -217,7 +252,7 @@ class KeyJuiceIndicator extends PanelMenu.Button {
             };
         }
 
-        if (type > 2) {
+        if (type >= 2) {
             return {
                 category: 'other',
                 name: model || '外设',
@@ -228,17 +263,19 @@ class KeyJuiceIndicator extends PanelMenu.Button {
         return null;
     }
 
-    _refresh() {
-        if (!this._upowerProxy) return;
+    async _refresh() {
+        if (this._destroyed || this._refreshing) return;
+        this._refreshing = true;
 
         try {
-            const res = this._upowerProxy.call_sync(
-                'EnumerateDevices',
-                null,
-                Gio.DBusCallFlags.NONE,
-                1000,
-                null
-            );
+            if (!this._upowerProxy) throw new Error('UPower unavailable');
+            const res = await new Promise((resolve, reject) => {
+                this._upowerProxy.call('EnumerateDevices', null, Gio.DBusCallFlags.NONE,
+                    1000, this._cancellable, (proxy, result) => {
+                        try { resolve(proxy.call_finish(result)); } catch (e) { reject(e); }
+                    });
+            });
+            if (this._destroyed) return;
             const [devicePaths] = res.recursiveUnpack();
             const currentPaths = new Set(devicePaths);
 
@@ -266,16 +303,17 @@ class KeyJuiceIndicator extends PanelMenu.Button {
                             g_object_path: path,
                             g_interface_name: 'org.freedesktop.UPower.Device',
                         });
-                        proxy.init(null);
+                        await this._initProxy(proxy);
+                        if (this._destroyed) return;
                         const model = proxy.get_cached_property('Model')?.unpack() || '';
                         const nativePath = proxy.get_cached_property('NativePath')?.unpack() || '';
                         const type = proxy.get_cached_property('Type')?.unpack() ?? 0;
-                        if (!this._classifyDevice(model, nativePath, type)) {
+                        if (!this._classifyDevice(model, nativePath, type, proxy.get_cached_property('PowerSupply')?.unpack() ?? false)) {
                             continue;
                         }
                         const signalId = proxy.connect('g-properties-changed', (_p, changed) => {
                             const props = changed.deepUnpack();
-                            if ('Percentage' in props || 'IsPresent' in props || 'State' in props) {
+                            if ('Percentage' in props || 'IsPresent' in props || 'State' in props || 'UpdateTime' in props) {
                                 this._updateDisplay();
                             }
                         });
@@ -291,9 +329,9 @@ class KeyJuiceIndicator extends PanelMenu.Button {
                 const nativePath = dev.proxy.get_cached_property('NativePath')?.unpack() || '';
                 const type = dev.proxy.get_cached_property('Type')?.unpack() ?? 0;
                 const isPresent = dev.proxy.get_cached_property('IsPresent')?.unpack() ?? false;
-                const rawPct = Math.round(dev.proxy.get_cached_property('Percentage')?.unpack() ?? 0);
-                const cls = this._classifyDevice(model, nativePath, type);
-                if (cls && cls.category === 'keyboard' && isPresent && rawPct > 0) {
+                const rawPct = Math.round(dev.proxy.get_cached_property('Percentage')?.unpack() ?? NaN);
+                const cls = this._classifyDevice(model, nativePath, type, dev.proxy.get_cached_property('PowerSupply')?.unpack() ?? false);
+                if (cls && cls.category === 'keyboard' && isPresent && Number.isFinite(rawPct) && rawPct >= 0 && rawPct <= 100) {
                     hasOnlineKb = true;
                     break;
                 }
@@ -306,11 +344,14 @@ class KeyJuiceIndicator extends PanelMenu.Button {
 
             this._updateDisplay();
         } catch (e) {
-            console.error('[KeyJuice] Refresh error:', e);
+            if (!this._destroyed) this._query24GKeyboard();
+        } finally {
+            this._refreshing = false;
         }
     }
 
     _updateDisplay() {
+        if (this._destroyed) return;
         let kbInfo = null;
         let mouseInfo = null;
         const allPeripherals = [];
@@ -322,35 +363,27 @@ class KeyJuiceIndicator extends PanelMenu.Button {
             const nativePath = proxy.get_cached_property('NativePath')?.unpack() || '';
             const type = proxy.get_cached_property('Type')?.unpack() ?? 0;
             const isPresent = proxy.get_cached_property('IsPresent')?.unpack() ?? false;
-            const rawPercentage = Math.round(proxy.get_cached_property('Percentage')?.unpack() ?? 0);
+            const rawPercentage = Math.round(proxy.get_cached_property('Percentage')?.unpack() ?? NaN);
             const state = proxy.get_cached_property('State')?.unpack() ?? 0;
             const isCharging = (state === 1);
 
-            const classification = this._classifyDevice(model, nativePath, type);
+            const classification = this._classifyDevice(model, nativePath, type, proxy.get_cached_property('PowerSupply')?.unpack() ?? false);
             if (!classification) continue;
 
             let percentage = 0;
-            const online = isPresent && rawPercentage > 0;
+            const online = isPresent && Number.isFinite(rawPercentage) && rawPercentage >= 0 && rawPercentage <= 100;
             if (online) {
-                currentOnline.add(classification.category);
-                if (!this._smoothers.has(classification.category)) {
-                    this._smoothers.set(classification.category, new BatterySmoother());
-                }
-                if (!this._seenOnline.has(classification.category)) {
-                    this._smoothers.get(classification.category).reset(rawPercentage);
-                }
-                percentage = this._smoothers.get(classification.category).update(rawPercentage, isCharging);
+                currentOnline.add(path);
+                const stamp = proxy.get_cached_property('UpdateTime')?.unpack() ?? '';
+                percentage = this._sample(path, `${stamp}:${rawPercentage}:${state}`, rawPercentage, isCharging);
             }
 
             const item = {
-                path,
-                model,
-                nativePath,
-                category: classification.category,
                 name: classification.name,
                 icon: classification.icon,
                 percentage,
                 isPresent: online,
+                unknown: isPresent && !online,
                 state,
             };
             allPeripherals.push(item);
@@ -368,18 +401,8 @@ class KeyJuiceIndicator extends PanelMenu.Button {
         }
         if ((!kbInfo || !kbInfo.isPresent) && this._kb24gInfo && this._kb24gInfo.online) {
             const rawPercentage = this._kb24gInfo.percentage;
-            if (!this._smoothers.has('keyboard')) {
-                this._smoothers.set('keyboard', new BatterySmoother());
-            }
-            if (!this._seenOnline.has('keyboard')) {
-                this._smoothers.get('keyboard').reset(rawPercentage);
-            }
-            const percentage = this._smoothers.get('keyboard').update(rawPercentage, false);
+            const percentage = this._sample('2.4g-x87', this._kb24gInfo.token, rawPercentage, false);
             kbInfo = {
-                path: '2.4g-x87',
-                model: '前行者 X87 (2.4G)',
-                nativePath: '0c45:fefe',
-                category: 'keyboard',
                 name: '前行者 X87 键盘',
                 icon: '⌨️',
                 percentage,
@@ -387,46 +410,20 @@ class KeyJuiceIndicator extends PanelMenu.Button {
                 state: 0,
             };
             allPeripherals.push(kbInfo);
-            currentOnline.add('keyboard');
+            currentOnline.add('2.4g-x87');
         }
 
 
-        this._seenOnline = currentOnline;
-
-        // Update Top Bar Labels
-        if (kbInfo && kbInfo.isPresent && kbInfo.percentage > 0) {
-            this._kbEmoji.text = '⌨️';
-            this._kbLabel.text = `${kbInfo.percentage}%`;
-            const low = kbInfo.percentage <= 20;
-            this._kbLabel.style = low ? 'color: #ff5555; font-weight: bold;' : '';
-            this._kbBox.style = '';
-            this._kbBox.visible = true;
-        } else if (kbInfo) {
-            this._kbEmoji.text = '⌨️';
-            this._kbLabel.text = '--%';
-            this._kbLabel.style = 'color: #888888;';
-            this._kbBox.style = 'opacity: 0.6;';
-            this._kbBox.visible = true;
-        } else {
-            this._kbBox.visible = false;
+        for (const key of this._smoothers.keys()) {
+            if (!currentOnline.has(key)) {
+                this._smoothers.delete(key);
+                this._sampleTokens.delete(key);
+                this._sampleValues.delete(key);
+            }
         }
 
-        if (mouseInfo && mouseInfo.isPresent && mouseInfo.percentage > 0) {
-            this._mouseEmoji.text = '🖱️';
-            this._mouseLabel.text = `${mouseInfo.percentage}%`;
-            const low = mouseInfo.percentage <= 20;
-            this._mouseLabel.style = low ? 'color: #ff5555; font-weight: bold;' : '';
-            this._mouseBox.style = '';
-            this._mouseBox.visible = true;
-        } else if (mouseInfo) {
-            this._mouseEmoji.text = '🖱️';
-            this._mouseLabel.text = '--%';
-            this._mouseLabel.style = 'color: #888888;';
-            this._mouseBox.style = 'opacity: 0.6;';
-            this._mouseBox.visible = true;
-        } else {
-            this._mouseBox.visible = false;
-        }
+        this._renderDevice(this._kbBox, this._kbEmoji, this._kbLabel, kbInfo, '⌨️');
+        this._renderDevice(this._mouseBox, this._mouseEmoji, this._mouseLabel, mouseInfo, '🖱️');
 
         if (!this._kbBox.visible && !this._mouseBox.visible) {
             this._kbEmoji.text = '🔋';
@@ -437,6 +434,9 @@ class KeyJuiceIndicator extends PanelMenu.Button {
         }
 
         // Update Dropdown Menu
+        const menuKey = JSON.stringify(allPeripherals);
+        if (menuKey === this._menuKey) return;
+        this._menuKey = menuKey;
         this.menu.removeAll();
 
         const titleItem = new PopupMenu.PopupMenuItem('🔋 KeyJuice 外设电量', { reactive: false });
@@ -452,7 +452,7 @@ class KeyJuiceIndicator extends PanelMenu.Button {
                 if (p.state === 1) stateText = ' (充电中)';
                 else if (p.state === 4) stateText = ' (已充满)';
 
-                const pctText = (p.isPresent && p.percentage > 0) ? `${p.percentage}%${stateText}` : '已离线';
+                const pctText = (p.isPresent && p.percentage >= 0) ? `${p.percentage}%${stateText}` : (p.unknown ? '电量未知' : '已离线');
 
                 let friendlyName = p.name;
                 if (friendlyName.includes('X87')) friendlyName = '前行者 X87 键盘';
@@ -471,7 +471,23 @@ class KeyJuiceIndicator extends PanelMenu.Button {
         this.menu.addMenuItem(refreshItem);
     }
 
+    _renderDevice(box, emoji, label, info, icon) {
+        box.visible = !!info;
+        if (!info) return;
+        emoji.text = icon;
+        const valid = info.isPresent && Number.isFinite(info.percentage);
+        label.text = valid ? `${info.percentage}%` : '--%';
+        label.style = valid ? (info.percentage <= 20 ? 'color: #ff5555; font-weight: bold;' : '') : 'color: #888888;';
+        box.style = valid ? '' : 'opacity: 0.6;';
+    }
+
     destroy() {
+        this._destroyed = true;
+        this._cancellable.cancel();
+        if (this._queryTimeout) GLib.source_remove(this._queryTimeout);
+        this._queryTimeout = 0;
+        this._proc?.force_exit();
+        this._proc = null;
         if (this._timerId) {
             GLib.source_remove(this._timerId);
             this._timerId = 0;
@@ -483,7 +499,7 @@ class KeyJuiceIndicator extends PanelMenu.Button {
             this._upowerProxy = null;
         }
 
-        for (const [path, dev] of this._deviceProxies) {
+        for (const dev of this._deviceProxies.values()) {
             if (dev.signalId) {
                 dev.proxy.disconnect(dev.signalId);
             }
