@@ -1,0 +1,16 @@
+{
+  "uuid": "keyjuice@shadowemperor",
+  "name": "KeyJuice",
+  "description": "实时显示无线键盘与鼠标电量 (前行者X87 / VXE R1 Pro 等)",
+  "shell-version": [
+    "45",
+    "46",
+    "47",
+    "48",
+    "49",
+    "50",
+    "51"
+  ],
+  "version": 1,
+  "url": "https://github.com/shadowemperor/KeyJuice"
+}

@@ -1,0 +1,2 @@
+# 前行者 X87 键盘 2.4G 接收器（微迪亚/松翰 0c45:fefe）
+KERNEL=="hidraw*", ATTRS{idVendor}=="0c45", ATTRS{idProduct}=="fefe", MODE="0666"

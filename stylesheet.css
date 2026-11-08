@@ -1,0 +1,17 @@
+.keyjuice-box {
+    spacing: 8px;
+    padding: 0 4px;
+}
+
+.keyjuice-item-box {
+    spacing: 4px;
+}
+
+.keyjuice-emoji {
+    font-size: 22px;
+}
+
+.keyjuice-label {
+    font-size: 13px;
+    font-weight: 500;
+}
